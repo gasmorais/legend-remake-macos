@@ -8,21 +8,28 @@ final class CacheProxy: @unchecked Sendable {
         case live
     }
 
-    let cache: URLCache
+    struct PrefetchProgress: Equatable {
+        var done = 0
+        var total = 0
+    }
+
     private let upstream: URL
-    private let session: URLSession
+    private let disk: DiskCache
+    private let legacy: URLSession
+    private let legacyCache: URLCache
+    private let downloader = Downloader()
     private let liveSession: URLSession
     private let listener: NWListener
     private let queue = DispatchQueue(label: "com.legendremake.cache", attributes: .concurrent)
-    private let index: CacheIndex
     private let requestLog = LogFile(Paths.shared.logs.appending(path: "requests.log"))
     private let state = ProxyState()
     private(set) var origin: URL?
+    var prefetchEnabled = true
+    var onPrefetchProgress: (@Sendable (PrefetchProgress) -> Void)?
 
     private static let forwardedRequestHeaders: Set<String> = [
         "user-agent", "referer", "accept", "accept-language", "content-type", "cookie", "x-flash-version", "x-requested-with",
     ]
-    private static let forwardedResponseHeaders = ["Content-Type", "Set-Cookie", "Content-Disposition"]
     private static let rewrittenPrefixes = ["/cdn/", "/xml/"]
     private static let rewrittenBases = ["REQUEST_PATH", "FOWARDSITE"]
     private static let staticExtensions: Set<String> = [
@@ -32,20 +39,15 @@ final class CacheProxy: @unchecked Sendable {
     private static let timestampParameters: Set<String> = ["v", "t", "time"]
     private static let freshFor: TimeInterval = 30 * 60
 
-    init(upstream: URL, directory: URL) throws {
+    init(upstream: URL, directory: URL, legacyDirectory: URL) throws {
         self.upstream = upstream
-        cache = URLCache(memoryCapacity: 128 << 20, diskCapacity: 4 << 30, directory: directory)
-        index = CacheIndex(file: Paths.shared.support.appending(path: "cache-index.json"))
+        disk = DiskCache(directory: directory)
 
-        let config = URLSessionConfiguration.default
-        config.urlCache = cache
-        config.requestCachePolicy = .useProtocolCachePolicy
-        config.httpShouldSetCookies = false
-        config.httpCookieAcceptPolicy = .never
-        config.httpMaximumConnectionsPerHost = 8
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 600
-        session = URLSession(configuration: config)
+        legacyCache = URLCache(memoryCapacity: 0, diskCapacity: 4 << 30, directory: legacyDirectory)
+        let legacyConfig = URLSessionConfiguration.default
+        legacyConfig.urlCache = legacyCache
+        legacyConfig.requestCachePolicy = .returnCacheDataDontLoad
+        legacy = URLSession(configuration: legacyConfig)
 
         let live = URLSessionConfiguration.ephemeral
         live.urlCache = nil
@@ -62,13 +64,16 @@ final class CacheProxy: @unchecked Sendable {
         listener = try NWListener(using: parameters)
     }
 
+    var diskUsage: Int64 { disk.usage + Int64(legacyCache.currentDiskUsage) }
+
     func start() async throws -> URL {
         let port = try await listener.startOnLoopback(queue: queue) { [weak self] connection in
             self?.serve(connection)
         }
         let url = URL(string: "http://127.0.0.1:\(port)/")!
         origin = url
-        log("[cache] proxy em \(url.absoluteString), \(ByteCountFormatter.string(fromByteCount: Int64(cache.currentDiskUsage), countStyle: .file)) em disco")
+        watchStalls()
+        log("[cache] proxy em \(url.absoluteString), \(ByteCountFormatter.string(fromByteCount: diskUsage, countStyle: .file)) em disco")
         prepare()
         return url
     }
@@ -79,24 +84,22 @@ final class CacheProxy: @unchecked Sendable {
     }
 
     func clear() {
-        cache.removeAllCachedResponses()
-        index.reset()
+        disk.clear()
+        legacyCache.removeAllCachedResponses()
         state.reset()
     }
 
     private func warmUp() async {
-        let entries = index.recentEntries(within: 14 * 24 * 3600)
+        let entries = disk.revalidationCandidates(usedWithin: 14 * 24 * 3600)
         guard !entries.isEmpty else { return }
         let started = Date()
         var refreshed = 0
         await withTaskGroup(of: Bool.self) { group in
             var pending = entries.makeIterator()
             func next() -> Bool {
-                guard let entry = pending.next(), let url = URL(string: entry.key) else { return false }
+                guard let entry = pending.next() else { return false }
                 group.addTask { [weak self] in
-                    var request = URLRequest(url: url, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 30)
-                    request.setValue(entry.userAgent, forHTTPHeaderField: "User-Agent")
-                    return await self?.revalidate(request, key: entry.key) ?? false
+                    await self?.revalidate(entry.key, userAgent: entry.meta.userAgent) ?? false
                 }
                 return true
             }
@@ -106,17 +109,25 @@ final class CacheProxy: @unchecked Sendable {
                 _ = next()
             }
         }
-        log("[cache] \(refreshed) de \(entries.count) arquivos revalidados em \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+        log("[cache] \(refreshed) de \(entries.count) arquivos conferidos em \(Int(Date().timeIntervalSince(started) * 1000)) ms")
     }
 
-    private func revalidate(_ request: URLRequest, key: String) async -> Bool {
+    @discardableResult
+    private func revalidate(_ key: String, userAgent: String?) async -> Bool {
         guard state.claim(key) else { return false }
         defer { state.release(key) }
-        var request = request
-        request.cachePolicy = .useProtocolCachePolicy
-        guard let (_, response) = try? await session.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { return false }
-        index.markValidated(key)
+        guard let url = URL(string: key), let current = disk.lookup(key) else { return false }
+        var headers: [String: String] = [:]
+        if let userAgent = userAgent ?? current.meta.userAgent { headers["User-Agent"] = userAgent }
+        guard let outcome = try? await downloader.fetch(url, headers: headers, validating: current.meta) else { return false }
+        switch outcome {
+        case .notModified:
+            disk.markValidated(key)
+        case .fetched(let response) where response.status == 200:
+            store(key, response, userAgent: userAgent, revalidates: true)
+        case .fetched:
+            return false
+        }
         return true
     }
 
@@ -125,11 +136,24 @@ final class CacheProxy: @unchecked Sendable {
         Task {
             var buffer = Data()
             while let request = await HTTPRequest.read(from: connection, buffer: &buffer) {
+                let id = state.begin("\(request.method) \(request.target)")
                 let response = await respond(to: request)
+                state.end(id)
                 await connection.sendAsync(response.serialized(headOnly: request.method == "HEAD"))
                 if !request.keepAlive { break }
             }
             connection.cancel()
+        }
+    }
+
+    private func watchStalls() {
+        Task.detached(priority: .utility) { [weak self] in
+            while let self {
+                try? await Task.sleep(for: .seconds(5))
+                for (request, seconds) in self.state.stalled(after: 15) {
+                    self.requestLog.write("AGUARDANDO \(seconds) s \(request)")
+                }
+            }
         }
     }
 
@@ -150,89 +174,170 @@ final class CacheProxy: @unchecked Sendable {
         components.port = upstream.port
         guard let url = components.url else { return HTTPResponse(status: 400) }
 
-        let freshness = Self.freshness(path: path, method: request.method)
-        let key = url.absoluteString
-        let userAgent = request.headers["user-agent"]
-        var outgoing = URLRequest(url: url, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 60)
-        outgoing.httpMethod = request.method == "HEAD" ? "GET" : request.method
+        var headers: [String: String] = [:]
         for (name, value) in request.headers where Self.forwardedRequestHeaders.contains(name) {
-            outgoing.setValue(value, forHTTPHeaderField: name)
-        }
-        if !request.body.isEmpty {
-            outgoing.httpBody = request.body
+            headers[name] = value
         }
 
         let started = Date()
         do {
-            var (data, http, source) = try await fetch(outgoing, freshness: freshness, key: key, userAgent: userAgent)
-            if http.statusCode == 200 {
-                if path == "/client/config.xml", let origin, let text = String(data: data, encoding: .utf8) {
-                    let sounds = await audioClasses(userAgent: userAgent)
-                    data = Data(rewriteConfig(text, origin: origin, sounds: sounds).utf8)
+            let freshness = Self.freshness(path: path, method: request.method)
+            var (response, source) = try await fetch(url, method: request.method, headers: headers, body: request.body, freshness: freshness)
+            if response.status == 200 {
+                if path == "/client/config.xml", let origin, let text = String(data: response.data, encoding: .utf8) {
+                    let sounds = await audioClasses(userAgent: headers["user-agent"])
+                    response.data = Data(rewriteConfig(text, origin: origin, sounds: sounds).utf8)
                 } else if path == "/client/Loading.swf" {
-                    data = await withSounds(data, userAgent: userAgent)
+                    response.data = await withSounds(response.data, userAgent: headers["user-agent"])
+                } else if path == "/client/code_md5.dat" {
+                    startPrefetch(manifest: response.data, userAgent: headers["user-agent"])
                 }
             }
-            var headers: [(String, String)] = []
-            for name in Self.forwardedResponseHeaders {
-                if let value = http.value(forHTTPHeaderField: name) { headers.append((name, value)) }
-            }
-            record(request.method, http.statusCode, source, started, data.count, request.target)
-            return HTTPResponse(status: http.statusCode, headers: headers, body: data)
+            var outgoing: [(String, String)] = []
+            if let type = response.contentType { outgoing.append(("Content-Type", type)) }
+            if let cookie = response.setCookie { outgoing.append(("Set-Cookie", cookie)) }
+            record(request.method, response.status, source, started, response.data.count, request.target)
+            return HTTPResponse(status: response.status, headers: outgoing, body: response.data)
         } catch {
             record(request.method, 502, "erro", started, 0, "\(request.target) (\(error.localizedDescription))")
             return HTTPResponse(status: 502)
         }
     }
 
-    private func fetch(_ request: URLRequest, freshness: Freshness, key: String, userAgent: String?) async throws -> (Data, HTTPURLResponse, String) {
+    private func fetch(_ url: URL, method: String, headers: [String: String], body: Data, freshness: Freshness) async throws -> (Downloader.Response, String) {
         if freshness == .live {
-            let metrics = FetchMetrics()
-            let (data, response) = try await liveSession.data(for: request, delegate: metrics)
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+            if !body.isEmpty { request.httpBody = body }
+            let (data, response) = try await liveSession.data(for: request)
             guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-            return (data, http, metrics.source)
+            return (Downloader.Response(
+                status: http.statusCode,
+                data: data,
+                contentType: http.value(forHTTPHeaderField: "Content-Type"),
+                setCookie: http.value(forHTTPHeaderField: "Set-Cookie")
+            ), "rede")
         }
 
-        let stored = await cachedCopy(of: request)
-        if let stored {
-            if freshness == .revalidate && !index.isFresh(key, within: Self.freshFor) {
-                index.markValidated(key, userAgent: userAgent, remember: true)
-                Task.detached(priority: .utility) { [weak self] in _ = await self?.revalidate(request, key: key) }
-                return (stored.0, stored.1, "disco+revalida")
+        let key = url.absoluteString
+        let userAgent = headers["user-agent"]
+        var cached = disk.lookup(key)
+        if cached == nil {
+            cached = await migrateLegacy(url, revalidates: freshness == .revalidate)
+        }
+        if let cached {
+            let response = Downloader.Response(status: 200, data: cached.data, etag: cached.meta.etag, lastModified: cached.meta.lastModified, contentType: cached.meta.contentType)
+            if freshness == .revalidate && !disk.isFresh(key, within: Self.freshFor) {
+                disk.markValidated(key, userAgent: userAgent)
+                Task.detached(priority: .utility) { [weak self] in await self?.revalidate(key, userAgent: userAgent) }
+                return (response, "disco+confere")
             }
-            return (stored.0, stored.1, "disco")
+            return (response, "disco")
         }
 
-        let metrics = FetchMetrics()
-        do {
-            let (data, response) = try await session.data(for: request, delegate: metrics)
-            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-            if http.statusCode == 200 {
-                index.markValidated(key, userAgent: userAgent, remember: freshness == .revalidate)
+        state.downloading(+1)
+        defer { state.downloading(-1) }
+        guard case .fetched(let response) = try await downloader.fetch(url, headers: headers) else {
+            throw URLError(.cannotParseResponse)
+        }
+        if response.status == 200 {
+            store(key, response, userAgent: userAgent, revalidates: freshness == .revalidate)
+        }
+        return (response, "rede")
+    }
+
+    private func store(_ key: String, _ response: Downloader.Response, userAgent: String?, revalidates: Bool) {
+        disk.store(key, data: response.data, meta: DiskCache.Meta(
+            etag: response.etag,
+            lastModified: response.lastModified,
+            contentType: response.contentType,
+            size: response.data.count,
+            validatedAt: Date(),
+            lastUsed: Date(),
+            userAgent: userAgent,
+            revalidates: revalidates
+        ))
+    }
+
+    private func migrateLegacy(_ url: URL, revalidates: Bool) async -> (data: Data, meta: DiskCache.Meta)? {
+        guard let (data, response) = try? await legacy.data(for: URLRequest(url: url, cachePolicy: .returnCacheDataDontLoad)),
+              let http = response as? HTTPURLResponse, http.statusCode == 200
+        else { return nil }
+        let meta = DiskCache.Meta(
+            etag: http.value(forHTTPHeaderField: "ETag"),
+            lastModified: http.value(forHTTPHeaderField: "Last-Modified"),
+            contentType: http.value(forHTTPHeaderField: "Content-Type"),
+            size: data.count,
+            validatedAt: .distantPast,
+            lastUsed: Date(),
+            userAgent: nil,
+            revalidates: revalidates
+        )
+        disk.store(url.absoluteString, data: data, meta: meta)
+        return (data, meta)
+    }
+
+    private func startPrefetch(manifest: Data, userAgent: String?) {
+        guard prefetchEnabled, state.beginPrefetch() else { return }
+        let urls = Self.modules(in: manifest, upstream: upstream)
+        guard !urls.isEmpty else {
+            state.endPrefetch()
+            return
+        }
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            defer { self.state.endPrefetch() }
+            var headers: [String: String] = [:]
+            if let userAgent { headers["User-Agent"] = userAgent }
+            var progress = PrefetchProgress(done: urls.filter { self.disk.contains($0.absoluteString) }.count, total: urls.count)
+            self.onPrefetchProgress?(progress)
+            let started = Date()
+            var bytes = 0
+            for url in urls where !self.disk.contains(url.absoluteString) {
+                guard self.prefetchEnabled else { return }
+                while self.state.busy {
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+                guard case .fetched(let response)? = try? await self.downloader.fetch(url, headers: headers, parallel: 3),
+                      response.status == 200 else { continue }
+                self.store(url.absoluteString, response, userAgent: userAgent, revalidates: false)
+                bytes += response.data.count
+                progress.done += 1
+                self.onPrefetchProgress?(progress)
             }
-            return (data, http, metrics.source)
-        } catch {
-            guard let stale = await cachedCopy(of: request, allowingAnyStatus: true) else { throw error }
-            return (stale.0, stale.1, "disco (servidor falhou)")
+            if bytes > 0 {
+                let size = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+                log("[cache] módulos pré-carregados: \(progress.done) de \(progress.total), \(size) em \(Int(Date().timeIntervalSince(started))) s")
+            }
         }
     }
 
-    private func cachedCopy(of request: URLRequest, allowingAnyStatus: Bool = false) async -> (Data, HTTPURLResponse)? {
-        var local = request
-        local.cachePolicy = .returnCacheDataDontLoad
-        guard let (data, response) = try? await session.data(for: local),
-              let http = response as? HTTPURLResponse,
-              allowingAnyStatus || http.statusCode == 200
-        else { return nil }
-        return (data, http)
+    private static func modules(in manifest: Data, upstream: URL) -> [URL] {
+        var data = manifest
+        while data.first == 0x78, let inflated = Zlib.inflate(data) {
+            data = inflated
+        }
+        guard let text = String(data: data, encoding: .utf8),
+              let pattern = try? NSRegularExpression(pattern: #"name="([^"]+)"\s+md5="([0-9a-f]+)""#)
+        else { return [] }
+        let range = NSRange(text.startIndex..., in: text)
+        return pattern.matches(in: text, range: range).compactMap { match in
+            guard let nameRange = Range(match.range(at: 1), in: text), let md5Range = Range(match.range(at: 2), in: text) else { return nil }
+            let name = text[nameRange].replacingOccurrences(of: "\\", with: "/")
+            let ext = (name as NSString).pathExtension
+            let stem = (name as NSString).deletingPathExtension
+            let hashed = ext.isEmpty ? "\(name)_\(text[md5Range])" : "\(stem)_\(text[md5Range]).\(ext)"
+            return URL(string: "cdn/" + hashed, relativeTo: upstream)?.absoluteURL
+        }
     }
 
     private func audioData(userAgent: String?) async -> Data? {
-        var request = URLRequest(url: upstream.appending(path: "cdn/audio.swf"), timeoutInterval: 60)
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        guard let (data, http, _) = try? await fetch(request, freshness: .revalidate, key: request.url!.absoluteString, userAgent: userAgent),
-              http.statusCode == 200 else { return nil }
-        return data
+        var headers: [String: String] = [:]
+        if let userAgent { headers["user-agent"] = userAgent }
+        guard let (response, _) = try? await fetch(upstream.appending(path: "cdn/audio.swf"), method: "GET", headers: headers, body: Data(), freshness: .revalidate),
+              response.status == 200 else { return nil }
+        return response.data
     }
 
     private func audioClasses(userAgent: String?) async -> [String] {
@@ -285,7 +390,7 @@ final class CacheProxy: @unchecked Sendable {
         }
         if !sounds.isEmpty, !result.contains("<sounds"), let close = result.range(of: "</config>") {
             let entries = sounds.sorted().map { "      <sound id=\"\($0.dropFirst(5))\" cls=\"\($0)\" />" }
-            let block = "    <sounds source=\"audio.swf\">\n" + entries.joined(separator: "\n") + "\n    </sounds>\n  "
+            let block = "  <sounds source=\"audio.swf\">\n" + entries.joined(separator: "\n") + "\n    </sounds>\n  "
             result.insert(contentsOf: block, at: close.lowerBound)
         }
         return result
@@ -299,10 +404,58 @@ final class ProxyState: @unchecked Sendable {
     private var loadingSource: Data?
     private var loadingMerged: Data?
     private var classes: [String]?
+    private var active: [Int: (request: String, since: Date, reported: Int)] = [:]
+    private var nextID = 0
+    private var downloads = 0
+    private var prefetching = false
 
     var soundClasses: [String]? {
         get { lock.withLock { classes } }
         set { lock.withLock { classes = newValue } }
+    }
+
+    var busy: Bool {
+        lock.withLock { downloads > 0 }
+    }
+
+    func downloading(_ delta: Int) {
+        lock.withLock { downloads += delta }
+    }
+
+    func beginPrefetch() -> Bool {
+        lock.withLock {
+            defer { prefetching = true }
+            return !prefetching
+        }
+    }
+
+    func endPrefetch() {
+        lock.withLock { prefetching = false }
+    }
+
+    func begin(_ request: String) -> Int {
+        lock.withLock {
+            nextID += 1
+            active[nextID] = (request, Date(), 0)
+            return nextID
+        }
+    }
+
+    func end(_ id: Int) {
+        _ = lock.withLock { active.removeValue(forKey: id) }
+    }
+
+    func stalled(after limit: TimeInterval) -> [(String, Int)] {
+        lock.withLock {
+            var result: [(String, Int)] = []
+            for (id, entry) in active {
+                let seconds = Int(Date().timeIntervalSince(entry.since))
+                guard seconds >= Int(limit), seconds / 15 > entry.reported else { continue }
+                active[id]?.reported = seconds / 15
+                result.append((entry.request, seconds))
+            }
+            return result
+        }
     }
 
     func beginWarmUp(every interval: TimeInterval) -> Bool {
@@ -343,159 +496,9 @@ final class ProxyState: @unchecked Sendable {
     }
 }
 
-final class FetchMetrics: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-    private(set) var source = "rede"
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        let transactions = metrics.transactionMetrics
-        if transactions.contains(where: { ($0.response as? HTTPURLResponse)?.statusCode == 304 }) {
-            source = "304"
-        } else if transactions.last?.resourceFetchType == .localCache {
-            source = "cache"
-        }
-    }
-}
-
-final class CacheIndex: @unchecked Sendable {
-    struct Entry: Codable {
-        var lastSeen: Date
-        var userAgent: String
-    }
-
-    private let file: URL
-    private let lock = NSLock()
-    private var entries: [String: Entry]
-    private var validated: [String: Date] = [:]
-    private var saveScheduled = false
-
-    init(file: URL) {
-        self.file = file
-        entries = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder.iso.decode([String: Entry].self, from: $0) } ?? [:]
-    }
-
-    func isFresh(_ key: String, within interval: TimeInterval) -> Bool {
-        lock.withLock { validated[key].map { Date().timeIntervalSince($0) < interval } ?? false }
-    }
-
-    func markValidated(_ key: String, userAgent: String? = nil, remember: Bool = false) {
-        let schedule: Bool = lock.withLock {
-            validated[key] = Date()
-            guard remember, let userAgent else { return false }
-            entries[key] = Entry(lastSeen: Date(), userAgent: userAgent)
-            defer { saveScheduled = true }
-            return !saveScheduled
-        }
-        if schedule {
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in self?.save() }
-        }
-    }
-
-    func recentEntries(within interval: TimeInterval) -> [(key: String, userAgent: String)] {
-        let limit = Date().addingTimeInterval(-interval)
-        return lock.withLock {
-            entries.filter { $0.value.lastSeen > limit }.map { (key: $0.key, userAgent: $0.value.userAgent) }
-        }
-    }
-
-    func reset() {
-        lock.withLock {
-            entries.removeAll()
-            validated.removeAll()
-        }
-        try? FileManager.default.removeItem(at: file)
-    }
-
-    private func save() {
-        let data: Data? = lock.withLock {
-            saveScheduled = false
-            return try? JSONEncoder.iso.encode(entries)
-        }
-        try? data?.write(to: file, options: .atomic)
-    }
-}
-
-struct HTTPRequest {
-    let method: String
-    let target: String
-    let headers: [String: String]
-    let body: Data
-    let keepAlive: Bool
-
-    static func read(from connection: NWConnection, buffer: inout Data) async -> HTTPRequest? {
-        let separator = Data("\r\n\r\n".utf8)
-        var headEnd = buffer.range(of: separator)
-        while headEnd == nil {
-            guard buffer.count < 64 * 1024, let chunk = await connection.receiveChunk() else { return nil }
-            buffer.append(chunk)
-            headEnd = buffer.range(of: separator)
-        }
-        guard let headEnd else { return nil }
-        let head = String(decoding: buffer[buffer.startIndex..<headEnd.lowerBound], as: UTF8.self)
-        buffer.removeSubrange(buffer.startIndex..<headEnd.upperBound)
-
-        var lines = head.components(separatedBy: "\r\n")
-        let start = lines.removeFirst().split(separator: " ", maxSplits: 2).map(String.init)
-        guard start.count == 3 else { return nil }
-        var headers: [String: String] = [:]
-        for line in lines {
-            guard let colon = line.firstIndex(of: ":") else { continue }
-            headers[line[..<colon].lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-        }
-
-        let length = Int(headers["content-length"] ?? "") ?? 0
-        while buffer.count < length {
-            guard let chunk = await connection.receiveChunk() else { return nil }
-            buffer.append(chunk)
-        }
-        let body = Data(buffer.prefix(length))
-        buffer.removeFirst(length)
-
-        let connectionHeader = headers["connection"]?.lowercased() ?? ""
-        let keepAlive = start[2] == "HTTP/1.1" ? connectionHeader != "close" : connectionHeader == "keep-alive"
-        return HTTPRequest(method: start[0].uppercased(), target: start[1], headers: headers, body: body, keepAlive: keepAlive)
-    }
-}
-
-struct HTTPResponse {
-    var status: Int
-    var headers: [(String, String)] = []
-    var body = Data()
-
-    func serialized(headOnly: Bool) -> Data {
-        let reason = [200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"][status] ?? "Status"
-        var head = "HTTP/1.1 \(status) \(reason)\r\n"
-        for (name, value) in headers {
-            head += "\(name): \(value)\r\n"
-        }
-        head += "Content-Length: \(body.count)\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n"
-        var data = Data(head.utf8)
-        if !headOnly { data.append(body) }
-        return data
-    }
-}
-
-extension NWConnection {
-    func receiveChunk() async -> Data? {
-        await withCheckedContinuation { continuation in
-            receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { data, _, complete, error in
-                if let data, !data.isEmpty {
-                    continuation.resume(returning: data)
-                } else {
-                    continuation.resume(returning: complete || error != nil ? nil : Data())
-                }
-            }
-        }
-    }
-
-    func sendAsync(_ data: Data) async {
-        await withCheckedContinuation { continuation in
-            send(content: data, completion: .contentProcessed { _ in continuation.resume() })
-        }
-    }
-}
-
-extension String {
-    func trimmingSuffix(_ suffix: String) -> String {
-        hasSuffix(suffix) ? String(dropLast(suffix.count)) : self
+enum Zlib {
+    static func inflate(_ data: Data) -> Data? {
+        guard data.count > 6, data.first == 0x78 else { return nil }
+        return try? (data.subdata(in: 2..<(data.count - 4)) as NSData).decompressed(using: .zlib) as Data
     }
 }

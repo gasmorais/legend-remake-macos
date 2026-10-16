@@ -12,6 +12,7 @@ struct Paths {
     let support: URL
     let logs: URL
     let cache: URL
+    let legacyCache: URL
     let engineRoot: URL
     let engineDescriptor: URL
     let adl: URL
@@ -24,7 +25,8 @@ struct Paths {
         let library = fm.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         support = library.appending(path: "Application Support/Legend Remake", directoryHint: .isDirectory)
         logs = library.appending(path: "Logs/Legend Remake", directoryHint: .isDirectory)
-        cache = library.appending(path: "Caches/com.legendremake.mac/Recursos", directoryHint: .isDirectory)
+        cache = library.appending(path: "Caches/com.legendremake.mac/Arquivos", directoryHint: .isDirectory)
+        legacyCache = library.appending(path: "Caches/com.legendremake.mac/Recursos", directoryHint: .isDirectory)
         let resources = Bundle.main.resourceURL!
         engineRoot = resources.appending(path: "engine", directoryHint: .isDirectory)
         engineDescriptor = engineRoot.appending(path: "application.xml")
@@ -40,7 +42,8 @@ enum AppInfo {
     static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
     static let commit = Bundle.main.object(forInfoDictionaryKey: "LRCommit") as? String ?? "dev"
     static let fullVersion = "\(version) (\(commit))"
-    static let userAgent = "LegendOnline/\(version) (macOS; launcher)"
+    static let gameVersion = Bundle.main.object(forInfoDictionaryKey: "LRGameVersion") as? String ?? version
+    static let userAgent = "LegendOnline/\(gameVersion) (macOS; launcher)"
 }
 
 final class LogFile: @unchecked Sendable {

@@ -53,6 +53,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var server: ServerState = .checking
     @Published private(set) var cacheUsage: Int64 = 0
     @Published var loginRequest: LoginRequest?
+    @Published private(set) var prefetch = CacheProxy.PrefetchProgress()
+
+    @Published var prefetchEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(prefetchEnabled, forKey: "prefetchEnabled")
+            proxy?.prefetchEnabled = prefetchEnabled
+        }
+    }
 
     @Published var highFrameRate: Bool {
         didSet {
@@ -79,9 +87,10 @@ final class AppModel: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        defaults.register(defaults: ["highFrameRate": false, "cacheEnabled": true])
+        defaults.register(defaults: ["highFrameRate": false, "cacheEnabled": true, "prefetchEnabled": true])
         highFrameRate = defaults.bool(forKey: "highFrameRate")
         cacheEnabled = defaults.bool(forKey: "cacheEnabled")
+        prefetchEnabled = defaults.bool(forKey: "prefetchEnabled")
         loadAccounts()
         UserDefaults(suiteName: "com.adobe.air.ADL")?.set(true, forKey: "NSAppSleepDisabled")
         Quarantine.clearBundle()
@@ -98,10 +107,14 @@ final class AppModel: ObservableObject {
             log("[ipc] não abriu: \(error.localizedDescription)")
         }
         do {
-            let proxy = try CacheProxy(upstream: Server.game, directory: Paths.shared.cache)
+            let proxy = try CacheProxy(upstream: Server.game, directory: Paths.shared.cache, legacyDirectory: Paths.shared.legacyCache)
+            proxy.prefetchEnabled = prefetchEnabled
+            proxy.onPrefetchProgress = { [weak self] progress in
+                Task { @MainActor in self?.prefetch = progress }
+            }
             _ = try await proxy.start()
             self.proxy = proxy
-            cacheUsage = Int64(proxy.cache.currentDiskUsage)
+            cacheUsage = proxy.diskUsage
         } catch {
             log("[cache] não abriu: \(error.localizedDescription)")
         }
@@ -218,13 +231,13 @@ final class AppModel: ObservableObject {
 
     func clearCache() {
         proxy?.clear()
-        URLCache.shared.removeAllCachedResponses()
-        cacheUsage = Int64(proxy?.cache.currentDiskUsage ?? 0)
+        prefetch = CacheProxy.PrefetchProgress()
+        cacheUsage = proxy?.diskUsage ?? 0
         log("[cache] limpo")
     }
 
     func refreshCacheUsage() {
-        cacheUsage = Int64(proxy?.cache.currentDiskUsage ?? 0)
+        cacheUsage = proxy?.diskUsage ?? 0
     }
 
     func handleShortcut(_ key: String, from session: GameSession) {

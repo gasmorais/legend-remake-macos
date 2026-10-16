@@ -397,6 +397,16 @@ struct SettingsView: View {
                 Text("Os arquivos do jogo ficam salvos neste Mac e só são baixados de novo quando o servidor os atualiza. A mudança vale a partir do próximo jogo aberto.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle("Baixar todos os módulos em segundo plano", isOn: $model.prefetchEnabled)
+                Text("Enquanto você joga, as telas do jogo que ainda não foram abertas são baixadas aos poucos, sem atrapalhar o que está carregando. Depois disso elas abrem na hora.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if model.prefetch.total > 0 {
+                    LabeledContent("Módulos no Mac") {
+                        Text("\(model.prefetch.done) de \(model.prefetch.total)")
+                            .monospacedDigit()
+                    }
+                }
                 LabeledContent("Espaço usado") {
                     Text(ByteCountFormatter.string(fromByteCount: model.cacheUsage, countStyle: .file))
                         .monospacedDigit()
