@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<application xmlns="http://ns.adobe.com/air/application/51.4">
+    <id>com.legendremake.engine</id>
+    <filename>LegendEngine</filename>
+    <name>Legend Remake</name>
+    <versionNumber>2.3.0</versionNumber>
+    <versionLabel>2.3.0</versionLabel>
+    <copyright>Legend Remake</copyright>
+    <allowMultipleInstances>true</allowMultipleInstances>
+    <initialWindow>
+        <content>Engine.swf</content>
+        <title>Legend Remake</title>
+        <systemChrome>standard</systemChrome>
+        <transparent>false</transparent>
+        <visible>false</visible>
+        <resizable>true</resizable>
+        <maximizable>true</maximizable>
+        <minimizable>true</minimizable>
+        <renderMode>direct</renderMode>
+        <depthAndStencil>true</depthAndStencil>
+        <width>1280</width>
+        <height>748</height>
+        <minSize>800 480</minSize>
+    </initialWindow>
+    <icon>
+        <image16x16>icons/icon16.png</image16x16>
+        <image32x32>icons/icon32.png</image32x32>
+        <image48x48>icons/icon48.png</image48x48>
+        <image128x128>icons/icon128.png</image128x128>
+    </icon>
+    <supportedProfiles>extendedDesktop desktop</supportedProfiles>
+</application>

@@ -1,0 +1,7 @@
+.DS_Store
+.build/
+*.app
+Resources/AIRSDK/
+Resources/AppIcon.icns
+Resources/engine/Engine.swf
+Resources/engine/icons/
