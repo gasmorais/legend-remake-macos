@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import IOKit.ps
 
 enum Server {
     static let api = URL(string: "https://servidor.legendremake.com/launcher/api/")!
@@ -69,8 +70,6 @@ final class LogFile: @unchecked Sendable {
         _ = try? handle?.seekToEnd()
     }
 
-    var fileHandle: FileHandle? { handle }
-
     func write(_ message: String) {
         let line = "\(Self.stamp.string(from: Date())) \(message)\n"
         lock.lock()
@@ -83,6 +82,15 @@ let launcherLog = LogFile(Paths.shared.logs.appending(path: "launcher.log"))
 
 func log(_ message: String) {
     launcherLog.write(message)
+}
+
+enum PowerSource {
+    static var onBattery: Bool {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue()
+        else { return false }
+        return (type as String) == kIOPSBatteryPowerValue
+    }
 }
 
 enum WindowVisibility {

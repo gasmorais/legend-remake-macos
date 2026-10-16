@@ -34,6 +34,7 @@ final class GameSession: ObservableObject, Identifiable {
     private var startedAt: Date?
     private var previousAccess: Date?
     private var sentFrameRate: Int?
+    private var hiddenChecks = 0
     private var sentTitle: String?
     private var task: Task<Void, Never>?
     private var watchdog: Timer?
@@ -41,6 +42,7 @@ final class GameSession: ObservableObject, Identifiable {
 
     private static let retryDelays: [TimeInterval] = [3, 10, 30]
     private static let hiddenFrameRate = 10
+    private static let backgroundFrameRate = 25
 
     init(username: String, model: AppModel) {
         self.username = username
@@ -96,11 +98,19 @@ final class GameSession: ObservableObject, Identifiable {
         }
     }
 
-    func updateFrameRate(visible: Bool, force: Bool = false) {
+    func updateFrameRate(visible: Bool, focused: Bool, force: Bool = false) {
         guard phase == .playing || phase == .hung, let startedAt else { return }
         if force { sentFrameRate = nil }
+        hiddenChecks = visible ? 0 : hiddenChecks + 1
         let warmingUp = Date().timeIntervalSince(startedAt) < 4
-        let target = visible || warmingUp ? model.frameRate : Self.hiddenFrameRate
+        let target: Int
+        if warmingUp || focused {
+            target = model.frameRate
+        } else if hiddenChecks >= 3 {
+            target = Self.hiddenFrameRate
+        } else {
+            target = min(model.frameRate, Self.backgroundFrameRate)
+        }
         guard target != sentFrameRate else { return }
         sentFrameRate = target
         link?.send("fps", String(target))
@@ -190,9 +200,19 @@ final class GameSession: ObservableObject, Identifiable {
             Paths.shared.engineDescriptor.path, Paths.shared.engineRoot.path,
             "--", "--ipc=\(server.port)", "--token=\(token)", "--slot=\(username)",
         ]
+        let output = Pipe()
+        let filter = EngineOutputFilter(log: engineLog)
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+            } else {
+                filter.consume(data)
+            }
+        }
         process.standardInput = FileHandle.nullDevice
-        process.standardOutput = engineLog.fileHandle
-        process.standardError = engineLog.fileHandle
+        process.standardOutput = output
+        process.standardError = output
         process.qualityOfService = .userInteractive
         process.terminationHandler = { [weak self] finished in
             let status = finished.terminationStatus
@@ -375,6 +395,32 @@ final class GameSession: ObservableObject, Identifiable {
             refreshTitle()
         default:
             break
+        }
+    }
+}
+
+final class EngineOutputFilter: @unchecked Sendable {
+    private static let noise = ["receive pkg.code", "error messaging the mach port"]
+    private let log: LogFile
+    private let lock = NSLock()
+    private var pending = Data()
+
+    init(log: LogFile) {
+        self.log = log
+    }
+
+    func consume(_ data: Data) {
+        let lines: [String] = lock.withLock {
+            pending.append(data)
+            var result: [String] = []
+            while let newline = pending.firstIndex(of: 0x0A) {
+                result.append(String(decoding: pending[pending.startIndex..<newline], as: UTF8.self))
+                pending.removeSubrange(pending.startIndex...newline)
+            }
+            return result
+        }
+        for line in lines where !line.isEmpty && !Self.noise.contains(where: line.contains) {
+            log.write(line)
         }
     }
 }

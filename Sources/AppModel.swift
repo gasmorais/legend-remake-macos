@@ -81,7 +81,9 @@ final class AppModel: ObservableObject {
     private var lastBoot: String?
     var showLauncher: (() -> Void)?
 
-    var frameRate: Int { highFrameRate ? 60 : 25 }
+    private(set) var onBattery = PowerSource.onBattery
+
+    var frameRate: Int { highFrameRate && !onBattery ? 60 : 25 }
     var proxyOrigin: URL? { cacheEnabled ? proxy?.origin : nil }
     var runningSessions: [GameSession] { accounts.compactMap { sessions[$0.id] }.filter(\.isRunning) }
 
@@ -265,8 +267,14 @@ final class AppModel: ObservableObject {
         let running = runningSessions
         guard !running.isEmpty else { return }
         let visible = WindowVisibility.onscreenProcesses()
+        guard !visible.isEmpty else { return }
+        let battery = PowerSource.onBattery
+        let changed = force || battery != onBattery
+        onBattery = battery
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
         for session in running {
-            session.updateFrameRate(visible: visible.contains(session.pid ?? 0), force: force)
+            let pid = session.pid ?? 0
+            session.updateFrameRate(visible: visible.contains(pid), focused: pid == frontmost, force: changed)
         }
     }
 

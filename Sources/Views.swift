@@ -123,7 +123,7 @@ private struct FooterView: View {
             Toggle("60 FPS", isOn: $model.highFrameRate)
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .help("Por padrão o jogo roda a 25 FPS. Em 60 FPS as animações ficam mais suaves, com um pouco mais de consumo.")
+                .help("Por padrão o jogo roda a 25 FPS. Em 60 FPS as animações ficam mais suaves e o consumo de CPU e bateria aumenta.")
             SettingsLink {
                 Image(systemName: "gearshape")
             }
@@ -388,7 +388,7 @@ struct SettingsView: View {
         Form {
             Section("Desempenho") {
                 Toggle("Modo 60 FPS", isOn: $model.highFrameRate)
-                Text("Janelas minimizadas ou ocultas passam para 10 FPS e voltam ao normal sozinhas.")
+                Text("Em 60 FPS, o jogo volta para 25 FPS quando o Mac está na bateria ou quando outro app está em foco. Janelas minimizadas ou ocultas passam para 10 FPS. Tudo volta ao normal sozinho.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

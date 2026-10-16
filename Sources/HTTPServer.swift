@@ -89,14 +89,21 @@ struct HTTPResponse {
     var headers: [(String, String)] = []
     var body = Data()
 
-    func serialized(headOnly: Bool) -> Data {
-        let reason = [200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"][status] ?? "Status"
-        var head = "HTTP/1.1 \(status) \(reason)\r\n"
+    static func head(status: Int, headers: [(String, String)], length: Int) -> Data {
+        var head = "HTTP/1.1 \(status) \(reason(status))\r\n"
         for (name, value) in headers {
             head += "\(name): \(value)\r\n"
         }
-        head += "Content-Length: \(body.count)\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n"
-        var data = Data(head.utf8)
+        head += "Content-Length: \(length)\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n"
+        return Data(head.utf8)
+    }
+
+    private static func reason(_ status: Int) -> String {
+        [200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 502: "Bad Gateway"][status] ?? "Status"
+    }
+
+    func serialized(headOnly: Bool) -> Data {
+        var data = Self.head(status: status, headers: headers, length: body.count)
         if !headOnly { data.append(body) }
         return data
     }

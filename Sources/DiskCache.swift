@@ -62,6 +62,15 @@ final class DiskCache: @unchecked Sendable {
         scheduleSave()
     }
 
+    func adoptValidators(_ key: String, etag: String?, lastModified: String?) {
+        lock.withLock {
+            entries[key]?.etag = etag
+            entries[key]?.lastModified = lastModified
+            entries[key]?.validatedAt = Date()
+        }
+        scheduleSave()
+    }
+
     func isFresh(_ key: String, within interval: TimeInterval) -> Bool {
         lock.withLock { entries[key].map { Date().timeIntervalSince($0.validatedAt) < interval } ?? false }
     }
